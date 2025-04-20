@@ -9,26 +9,26 @@
 #include <mempool_log.h>
 
 // 查找第一个置位的位(编译器优化版本)
-static inline int find_first_set_bit(BITMAP_TYPE word)
+static inline int find_first_set_bit(BITMAP_TYPE bitmap)
 {
-    if (word == 0) return -1;
+    if (bitmap == 0) return -1;
     
 #if defined(__riscv) && defined(__riscv_bitmanip)
     // RISC-V with B扩展支持
     int index;
-    asm volatile ("bset %0, %1, zero" : "=r" (index) : "r" (word));
+    asm volatile ("bset %0, %1, zero" : "=r" (index) : "r" (bitmap));
     return index;
 #elif defined(__GNUC__) || defined(__clang__)
     // 使用编译器内置函数
     if (sizeof(BITMAP_TYPE) == 4) {
-        return __builtin_ffs(word) - 1;
+        return __builtin_ffs(bitmap) - 1;
     } else if (sizeof(BITMAP_TYPE) == 8) {
-        return __builtin_ffsll(word) - 1;
+        return __builtin_ffsll(bitmap) - 1;
     }
 #else
     // 通用实现
     for (int i = 0; i < sizeof(BITMAP_TYPE)*8; i++) {
-        if (word & ((BITMAP_TYPE)1 << i)) return i;
+        if (bitmap & ((BITMAP_TYPE)1 << i)) return i;
     }
     return -1;
 #endif
@@ -57,12 +57,11 @@ static inline int find_first_set_bit(BITMAP_TYPE word)
 // 创建内存池
 mempool_t *mempool_create(size_t data_size, size_t num_blocks)
 {
-    DEBUG_PRINT("Creating mempool: data_size=%zu, num_blocks=%zu", data_size, num_blocks);
-    
-    // 参数校验
-    if (num_blocks == 0 || num_blocks > MEMPOOL_MAX_BLOCKS) {
+    if (data_size == 0 || num_blocks == 0 || num_blocks > MEMPOOL_MAX_BLOCKS) {
         return NULL;
     }
+
+    DEBUG_PRINT("Creating mempool: data_size=%zu, num_blocks=%zu", data_size, num_blocks);
 
     // 计算对齐后的块大小
     size_t aligned_size = (data_size + MEMPOOL_ALIGNMENT - 1) & ~(MEMPOOL_ALIGNMENT - 1);
@@ -83,8 +82,13 @@ mempool_t *mempool_create(size_t data_size, size_t num_blocks)
         MEMPOOL_FREE(pool);
         return NULL;
     }
+
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_INIT(&pool->lock);
+#endif
     
     // 初始化参数
+    pool->block_size_unaligned = data_size;
     pool->block_size = aligned_size;
     pool->block_count = num_blocks;
     
@@ -126,30 +130,32 @@ uint8_t *mempool_alloc(mempool_t *pool, bool for_hw)
 {
     MEMPOOL_ASSERT(pool != NULL);
 
-    BITMAP_TYPE word;
-    MEMPOOL_IRQ_LOCK_T lock;
+    BITMAP_TYPE bitmap;
+    int bit_pos;
+    int block_idx;
+    uint8_t *block = NULL;
+
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
 
     DEBUG_PRINT("Allocating block (for_hw=%d)", for_hw);
 
-    MEMPOOL_IRQ_LOCK(lock);
+    MEMPOOL_LOCK(lock);
 
     for (int i = 0; i < BITMAP_WORDS; i++)
     {
-        word = pool->free_bitmap[i];
-        if (word == 0)
-            continue; // 关键优化：跳过无空闲块的字
+        if ((bitmap = pool->free_bitmap[i]) == 0)
+            continue;
 
-        // 直接使用编译器内置指令查找第一个置位比特
-        int bit_pos = find_first_set_bit(word);
-        if (bit_pos < 0)
-            continue; // 理论上不会触发，因word!=0
+        if ((bit_pos = find_first_set_bit(bitmap)) < 0)
+            continue;
 
-        // 计算全局块索引
-        int block_idx = i * (sizeof(BITMAP_TYPE) * 8) + bit_pos;
-        if (block_idx >= pool->block_count)
-        {
-            continue; // 超出实际块数（由末尾非对齐块处理）
-        }
+        // 超出实际块数
+        if ((block_idx = i * MEMPOOL_BITMAP_EACH_NUM + bit_pos) >= pool->block_count)
+            continue;
 
         // 标记块为已分配
         pool->free_bitmap[i] &= ~((BITMAP_TYPE)1 << bit_pos);
@@ -159,15 +165,15 @@ uint8_t *mempool_alloc(mempool_t *pool, bool for_hw)
         }
 
         // 返回内存块地址
-        uint8_t *block = pool->memory_area + block_idx * pool->block_size;
-        MEMPOOL_IRQ_UNLOCK(lock);
+        block = pool->memory_area + block_idx * pool->block_size;
+        MEMPOOL_UNLOCK(lock);
 
-        DEBUG_PRINT("Found free block at index %d (word %d, bit %d)", block_idx, i, bit_pos);
+        DEBUG_PRINT("Found free block at index %d (bitmap %d, bit %d)", block_idx, i, bit_pos);
 
         return block;
     }
 
-    MEMPOOL_IRQ_UNLOCK(lock);
+    MEMPOOL_UNLOCK(lock);
 
     DEBUG_PRINT("No free blocks available");
 
@@ -186,15 +192,20 @@ void mempool_free(mempool_t *pool, uint8_t *ptr)
         return;
     }
     
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
     
     // 计算块索引
     size_t offset = ptr - pool->memory_area;
     size_t block_idx = offset / pool->block_size;
     
     if (block_idx >= pool->block_count) {
-        MEMPOOL_IRQ_UNLOCK(lock);
+        MEMPOOL_UNLOCK(lock);
         return; // 非法指针
     }
     
@@ -204,7 +215,7 @@ void mempool_free(mempool_t *pool, uint8_t *ptr)
     
     // 验证状态
     if ((pool->free_bitmap[word_idx] & ((BITMAP_TYPE)1 << bit_pos)) != 0) {
-        MEMPOOL_IRQ_UNLOCK(lock);
+        MEMPOOL_UNLOCK(lock);
         DEBUG_PRINT("Block already free at %p", ptr);
         return; // 已经是空闲状态
     }
@@ -217,7 +228,7 @@ void mempool_free(mempool_t *pool, uint8_t *ptr)
     // 标记为空闲
     pool->free_bitmap[word_idx] |= ((BITMAP_TYPE)1 << bit_pos);
     
-    MEMPOOL_IRQ_UNLOCK(lock);
+    MEMPOOL_UNLOCK(lock);
 }
 
 // 获取可用块数量
@@ -225,8 +236,13 @@ size_t mempool_available(mempool_t *pool)
 {
     if (!pool) return 0;
     
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
     
     size_t count = 0;
     for (int i = 0; i < BITMAP_WORDS; i++) {
@@ -234,7 +250,7 @@ size_t mempool_available(mempool_t *pool)
         count += POPCOUNT_LL(pool->free_bitmap[i]);
     }
     
-    MEMPOOL_IRQ_UNLOCK(lock);
+    MEMPOOL_UNLOCK(lock);
     return count;
 }
 
@@ -243,6 +259,12 @@ size_t mempool_used(mempool_t *pool)
 {
     if (!pool) return 0;
     return pool->block_count - mempool_available(pool);
+}
+
+size_t mempool_block_size(mempool_t *pool)
+{
+    if (!pool) return 0;
+    return pool->block_size;
 }
 
 // 获取块索引
@@ -279,6 +301,14 @@ mempool_queue_t *mempool_queue_create(mempool_t *pool, size_t capacity)
         MEMPOOL_FREE(queue);
         return NULL;
     }
+
+    queue->data_lengths = MEMPOOL_MALLOC(sizeof(size_t) * capacity);
+    if (!queue->data_lengths) {
+        ERROR_PRINT("Failed to allocate data lengths array");
+        MEMPOOL_FREE(queue->block_indices);
+        MEMPOOL_FREE(queue);
+        return NULL;
+    }
     
     queue->pool = pool;
     queue->capacity = capacity;
@@ -307,66 +337,119 @@ void mempool_queue_destroy(mempool_queue_t *queue)
     MEMPOOL_FREE(queue);
 }
 
+/* 内部函数：验证队列和指针有效性 */
+static int validate_queue_and_buffer(mempool_queue_t *queue, uint8_t *buffer, int *block_idx)
+{
+    if (!queue || !buffer || queue->count >= queue->capacity) {
+        return -1;
+    }
+
+    *block_idx = get_block_index(queue->pool, buffer);
+    if (*block_idx < 0 || *block_idx >= queue->pool->block_count) {
+        return -1;
+    }
+
+    // int word_idx = *block_idx / (sizeof(BITMAP_TYPE)*8);
+    // int bit_pos = *block_idx % (sizeof(BITMAP_TYPE)*8);
+    int word_idx = *block_idx >> LOG2_MEMPOOL_BITMAP_EACH_NUM;// 代替除法
+    int bit_pos = *block_idx & (MEMPOOL_BITMAP_EACH_NUM - 1);// 代替模运算
+    
+    if (queue->queue_bitmap[word_idx] & ((BITMAP_TYPE)1 << bit_pos)) {
+        return -1; // 已在队列中
+    }
+
+    return 0;
+}
+
+/* 内部函数：执行实际的入队操作 */
+static void do_enqueue(mempool_queue_t *queue, int block_idx, size_t data_length)
+{
+    queue->block_indices[queue->tail] = (uint16_t)block_idx;
+    queue->data_lengths[queue->tail] = data_length;
+    queue->tail = (queue->tail + 1) % queue->capacity;
+    queue->count++;
+    
+    int word_idx = block_idx >> LOG2_MEMPOOL_BITMAP_EACH_NUM;
+    int bit_pos = block_idx & (MEMPOOL_BITMAP_EACH_NUM - 1);
+    queue->queue_bitmap[word_idx] |= ((BITMAP_TYPE)1 << bit_pos);
+}
+
+/* 内部函数：执行实际的出队操作 */
+static uint8_t *do_dequeue(mempool_queue_t *queue, size_t *data_length)
+{
+    uint16_t block_idx = queue->block_indices[queue->head];
+    if (data_length) {
+        *data_length = queue->data_lengths[queue->head];
+    }
+    
+    queue->head = (queue->head + 1) % queue->capacity;
+    queue->count--;
+    
+    int word_idx = block_idx >> LOG2_MEMPOOL_BITMAP_EACH_NUM;
+    int bit_pos = block_idx & (MEMPOOL_BITMAP_EACH_NUM - 1);
+    queue->queue_bitmap[word_idx] &= ~((BITMAP_TYPE)1 << bit_pos);
+    
+    return queue->pool->memory_area + block_idx * queue->pool->block_size;
+}
+
 // 入队操作
 int mempool_queue_enqueue(mempool_queue_t *queue, uint8_t *buffer)
 {
-    DEBUG_PRINT("Enqueuing buffer %p to queue %p", buffer, queue);
+    return mempool_queue_enqueue_with_length(queue, buffer, 0);
+}
 
-    if (!queue || !buffer || queue->count >= queue->capacity) {
-        DEBUG_PRINT("Queue full (count=%zu, capacity=%zu)", queue->count, queue->capacity);
+int mempool_queue_enqueue_with_length(mempool_queue_t *queue, uint8_t *buffer, size_t data_length)
+{
+    DEBUG_PRINT("Enqueuing buffer %p with length %zu to queue %p", 
+               buffer, data_length, queue);
+
+    int block_idx;
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &queue->pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
+    
+    if (validate_queue_and_buffer(queue, buffer, &block_idx) < 0) {
+        MEMPOOL_UNLOCK(lock);
+        DEBUG_PRINT("Enqueue validation failed");
         return -1;
     }
     
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
+    do_enqueue(queue, block_idx, data_length);
     
-    int block_idx = get_block_index(queue->pool, buffer);
-    if (block_idx < 0 || block_idx >= queue->pool->block_count) {
-        MEMPOOL_IRQ_UNLOCK(lock);
-        return -1;
-    }
-    
-    int word_idx = block_idx / (sizeof(BITMAP_TYPE)*8);
-    int bit_pos = block_idx % (sizeof(BITMAP_TYPE)*8);
-    
-    if (queue->queue_bitmap[word_idx] & ((BITMAP_TYPE)1 << bit_pos)) {
-        MEMPOOL_IRQ_UNLOCK(lock);
-        DEBUG_PRINT("Buffer %p already in queue", buffer);
-        return -1;
-    }
-    
-    queue->block_indices[queue->tail] = (uint16_t)block_idx;
-    queue->tail = (queue->tail + 1) % queue->capacity;
-    queue->count++;
-    queue->queue_bitmap[word_idx] |= ((BITMAP_TYPE)1 << bit_pos);
-    
-    MEMPOOL_IRQ_UNLOCK(lock);
+    MEMPOOL_UNLOCK(lock);
     return 0;
 }
 
 // 出队操作
 uint8_t *mempool_queue_dequeue(mempool_queue_t *queue)
 {
-    DEBUG_PRINT("Dequeuing from queue %p", queue);
+    size_t dummy;
+    return mempool_queue_dequeue_with_length(queue, &dummy);
+}
+
+uint8_t *mempool_queue_dequeue_with_length(mempool_queue_t *queue, size_t *data_length)
+{
+    DEBUG_PRINT("Dequeuing from queue %p with length", queue);
 
     if (!queue || queue->count == 0) {
+        if (data_length) *data_length = 0;
         return NULL;
     }
     
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &queue->pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
+    uint8_t *block = do_dequeue(queue, data_length);
+    MEMPOOL_UNLOCK(lock);
     
-    uint16_t block_idx = queue->block_indices[queue->head];
-    queue->head = (queue->head + 1) % queue->capacity;
-    queue->count--;
-    
-    int word_idx = block_idx / (sizeof(BITMAP_TYPE)*8);
-    int bit_pos = block_idx % (sizeof(BITMAP_TYPE)*8);
-    queue->queue_bitmap[word_idx] &= ~((BITMAP_TYPE)1 << bit_pos);
-    
-    uint8_t *block = queue->pool->memory_area + block_idx * queue->pool->block_size;
-    
-    MEMPOOL_IRQ_UNLOCK(lock);
     return block;
 }
 
@@ -379,42 +462,47 @@ uint8_t *mempool_queue_peek(mempool_queue_t *queue)
         return NULL;
     }
     
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &queue->pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
     
     uint16_t block_idx = queue->block_indices[queue->head];
     uint8_t *block = queue->pool->memory_area + block_idx * queue->pool->block_size;
     
-    MEMPOOL_IRQ_UNLOCK(lock);
+    MEMPOOL_UNLOCK(lock);
     return block;
 }
 
 // 批量出队
-size_t mempool_queue_dequeue_batch(mempool_queue_t *queue, uint8_t **buffers, size_t max_count)
+size_t mempool_queue_dequeue_batch_with_length(mempool_queue_t *queue, 
+    uint8_t **buffers, 
+    size_t *data_lengths,
+    size_t max_count)
 {
-    DEBUG_PRINT("Dequeuing batch of %zu from queue %p", max_count, queue);
+    DEBUG_PRINT("Dequeuing batch of %zu from queue %p with lengths", max_count, queue);
 
     if (!queue || !buffers || max_count == 0) {
-        return 0;
+    return 0;
     }
-    
-    MEMPOOL_IRQ_LOCK_T lock;
-    MEMPOOL_IRQ_LOCK(lock);
-    
+
+#ifdef MEMPOOL_LOCK_INIT
+    MEMPOOL_LOCK_TYPE *lock = &queue->pool->lock;
+#else
+    MEMPOOL_LOCK_TYPE lock;
+#endif
+
+    MEMPOOL_LOCK(lock);
+
     size_t actual_count = MEMPOOL_MIN(queue->count, max_count);
     for (size_t i = 0; i < actual_count; i++) {
-        uint16_t block_idx = queue->block_indices[queue->head];
-        queue->head = (queue->head + 1) % queue->capacity;
-        
-        int word_idx = block_idx / (sizeof(BITMAP_TYPE)*8);
-        int bit_pos = block_idx % (sizeof(BITMAP_TYPE)*8);
-        queue->queue_bitmap[word_idx] &= ~((BITMAP_TYPE)1 << bit_pos);
-        
-        buffers[i] = queue->pool->memory_area + block_idx * queue->pool->block_size;
+        buffers[i] = do_dequeue(queue, data_lengths ? &data_lengths[i] : NULL);
     }
-    
-    queue->count -= actual_count;
-    MEMPOOL_IRQ_UNLOCK(lock);
+
+    MEMPOOL_UNLOCK(lock);
     return actual_count;
 }
 

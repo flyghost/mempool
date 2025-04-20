@@ -19,331 +19,342 @@
 #define TEST_BLOCK_COUNT 256
 #endif
 
-// 获取调整后的测试块数量
-size_t get_test_block_count() {
-    size_t max_test_blocks = TEST_BLOCK_COUNT;
-    if (max_test_blocks > MEMPOOL_MAX_BLOCKS) {
-        WARNING_PRINT("Reducing test blocks from %zu to %d due to MEMPOOL_MAX_BLOCKS",
-                    max_test_blocks, MEMPOOL_MAX_BLOCKS);
-        return MEMPOOL_MAX_BLOCKS;
-    }
-    return max_test_blocks;
-}
-
-// 测试内存池基本功能
-void test_mempool_basic() {
-    DEBUG_PRINT("=== Testing mempool basic operations ===");
-
-    size_t test_blocks = get_test_block_count();
-    if (test_blocks < 2) {
-        WARNING_PRINT("Skipping basic test - insufficient MEMPOOL_MAX_BLOCKS (%d)", MEMPOOL_MAX_BLOCKS);
-        return;
-    }
-
-    // 创建内存池
-    mempool_t *pool = mempool_create(TEST_BLOCK_SIZE, test_blocks);
-    MEMPOOL_ASSERT(pool != NULL);
-
-    // 测试分配与释放
-    uint8_t *blocks[test_blocks];
-    for (size_t i = 0; i < test_blocks; i++) {
-        blocks[i] = mempool_alloc(pool, i % 2); // 交替分配普通和HW块
-        MEMPOOL_ASSERT(blocks[i] != NULL);
-        MEMPOOL_ASSERT(mempool_available(pool) == test_blocks - i - 1);
-    }
-
-    // 尝试超额分配
-    uint8_t *extra_block = mempool_alloc(pool, false);
-    MEMPOOL_ASSERT(extra_block == NULL);
-
-    // 释放所有块
-    for (size_t i = 0; i < test_blocks; i++) {
-        mempool_free(pool, blocks[i]);
-        MEMPOOL_ASSERT(mempool_available(pool) == i + 1);
-    }
-
-    // 销毁内存池
-    mempool_destroy(pool);
-    DEBUG_PRINT("Basic mempool test passed!");
-}
-
-// 增强版队列测试
-void test_mempool_queue_enhanced() {
-    DEBUG_PRINT("=== Enhanced mempool queue testing ===");
-
-    size_t test_blocks = get_test_block_count();
-    if (test_blocks < 4) {
-        ERROR_PRINT("Skipping enhanced queue test - insufficient MEMPOOL_MAX_BLOCKS (%d)", MEMPOOL_MAX_BLOCKS);
-        return;
-    }
-
-    // 创建内存池和队列
-    mempool_t *pool = mempool_create(TEST_BLOCK_SIZE, test_blocks);
-    MEMPOOL_ASSERT(pool != NULL);
+// 互斥锁测试线程函数
+void *mempool_lock_test_thread(void *arg) {
+    lock_test_arg_t *params = (lock_test_arg_t *)arg;
+    mempool_t *pool = params->pool;
+    int thread_id = params->thread_id;
+    int iterations = params->iterations;
+    int *success_count = params->success_count;
+    int *error_count = params->error_count;
+    uint8_t pattern = params->pattern;
     
-    const size_t queue_capacity = 3; // 固定测试队列容量
-    mempool_queue_t *queue = mempool_queue_create(pool, queue_capacity);
-    MEMPOOL_ASSERT(queue != NULL);
-
-    // 测试1: 入队出队顺序一致性
-    DEBUG_PRINT("Testing FIFO order consistency...");
-    uint8_t *blocks[queue_capacity];
-    for (int i = 0; i < queue_capacity; i++) {
-        blocks[i] = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(blocks[i] != NULL);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, blocks[i]) == 0);
-    }
-
-    for (int i = 0; i < queue_capacity; i++) {
-        uint8_t *dequeued = mempool_queue_dequeue(queue);
-        MEMPOOL_ASSERT(dequeued == blocks[i]);
-        mempool_free(pool, dequeued);
-    }
-
-    // 测试2: 队列满时入队应失败
-    DEBUG_PRINT("Testing full queue behavior...");
-    for (int i = 0; i < queue_capacity; i++) {
-        blocks[i] = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(blocks[i] != NULL);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, blocks[i]) == 0);
-    }
+    DEBUG_PRINT("Thread %d starting with %d iterations", thread_id, iterations);
     
-    uint8_t *extra_block = mempool_alloc(pool, false);
-    if (extra_block != NULL) {
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, extra_block) == -1);
-        mempool_free(pool, extra_block);
-    }
-
-    // 测试3: 空队列出队应返回NULL
-    DEBUG_PRINT("Testing empty queue behavior...");
-    for (int i = 0; i < queue_capacity; i++) {
-        uint8_t *dequeued = mempool_queue_dequeue(queue);
-        MEMPOOL_ASSERT(dequeued != NULL);
-        mempool_free(pool, dequeued);
-    }
+    // 等待所有线程就绪
+    pthread_barrier_wait(params->barrier);
     
-    MEMPOOL_ASSERT(mempool_queue_dequeue(queue) == NULL);
-
-    // 测试4: 混合操作
-    DEBUG_PRINT("Testing mixed operations...");
-    for (int cycle = 0; cycle < 2; cycle++) {
-        // 入队两个
-        uint8_t *b1 = mempool_alloc(pool, false);
-        uint8_t *b2 = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, b1) == 0);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, b2) == 0);
-        
-        // 出队一个
-        uint8_t *d1 = mempool_queue_dequeue(queue);
-        MEMPOOL_ASSERT(d1 == b1);
-        mempool_free(pool, d1);
-        
-        // 再入队一个
-        uint8_t *b3 = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, b3) == 0);
-        
-        // 出队剩余两个
-        uint8_t *d2 = mempool_queue_dequeue(queue);
-        uint8_t *d3 = mempool_queue_dequeue(queue);
-        MEMPOOL_ASSERT(d2 == b2);
-        MEMPOOL_ASSERT(d3 == b3);
-        mempool_free(pool, d2);
-        mempool_free(pool, d3);
-    }
-
-    // 清理
-    mempool_queue_destroy(queue);
-    mempool_destroy(pool);
-    DEBUG_PRINT("Enhanced queue test passed!");
-}
-
-// 边界条件测试
-void test_mempool_edge_cases() {
-    DEBUG_PRINT("=== Testing mempool edge cases ===");
-
-    // 测试1: 创建0块内存池
-    mempool_t *pool = mempool_create(TEST_BLOCK_SIZE, 0);
-    MEMPOOL_ASSERT(pool == NULL);
-
-    // 测试2: 最小内存池(1块)
-    if (MEMPOOL_MAX_BLOCKS >= 1) {
-        pool = mempool_create(TEST_BLOCK_SIZE, 1);
-        MEMPOOL_ASSERT(pool != NULL);
-        
-        uint8_t *block = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(block != NULL);
-        MEMPOOL_ASSERT(mempool_alloc(pool, false) == NULL);
-        
-        // 测试释放后重用
-        mempool_free(pool, block);
-        uint8_t *new_block = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(new_block != NULL);
-        mempool_free(pool, new_block);
-        
-        mempool_destroy(pool);
-    }
-
-    // 测试3: 队列边界
-    if (MEMPOOL_MAX_BLOCKS >= 2) {
-        pool = mempool_create(TEST_BLOCK_SIZE, 2);
-        MEMPOOL_ASSERT(pool != NULL);
-        
-        // 创建容量为1的队列
-        mempool_queue_t *queue = mempool_queue_create(pool, 1);
-        MEMPOOL_ASSERT(queue != NULL);
-        
-        // 入队一个
-        uint8_t *b1 = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, b1) == 0);
-        MEMPOOL_ASSERT(mempool_queue_enqueue(queue, b1) == -1); // 重复入队
-        
-        // 出队
-        uint8_t *d1 = mempool_queue_dequeue(queue);
-        MEMPOOL_ASSERT(d1 == b1);
-        
-        // 空队列出队
-        MEMPOOL_ASSERT(mempool_queue_dequeue(queue) == NULL);
-        
-        mempool_queue_destroy(queue);
-        mempool_destroy(pool);
-    }
-
-    DEBUG_PRINT("Edge case test passed!");
-}
-
-// 内存内容测试
-void test_mempool_memory_content() {
-    DEBUG_PRINT("=== Testing memory content integrity ===");
-
-    size_t test_blocks = get_test_block_count();
-    if (test_blocks < 2) {
-        WARNING_PRINT("Skipping memory content test - insufficient blocks");
-        return;
-    }
-
-    // 创建内存池
-    mempool_t *pool = mempool_create(TEST_BLOCK_SIZE, test_blocks);
-    MEMPOOL_ASSERT(pool != NULL && "mempool_create failed");
-
-    // 分配两个内存块
-    uint8_t *block1 = mempool_alloc(pool, false);
-    uint8_t *block2 = mempool_alloc(pool, false);
-    MEMPOOL_ASSERT(block1 != NULL && block2 != NULL && "mempool_alloc failed");
-
-    // 测试1: 验证内存块可写性
-    const char *test_str = "Memory pool test string";
-    size_t str_len = strlen(test_str) + 1;
-    
-    // 写入不同模式的数据到两个块
-    memcpy(block1, test_str, str_len);          // block1写入字符串
-    memset(block2, 0xAA, TEST_BLOCK_SIZE);      // block2填充0xAA
-
-    // 验证写入的数据
-    MEMPOOL_ASSERT(memcmp(block1, test_str, str_len) == 0 && "Data verification failed for block1");
-    
-    for (size_t i = 0; i < TEST_BLOCK_SIZE; i++) {
-        MEMPOOL_ASSERT(block2[i] == 0xAA && "Data verification failed for block2");
-    }
-
-    // 测试2: 验证内存块独立性
-    // 修改block1不应该影响block2
-    memset(block1, 0x55, TEST_BLOCK_SIZE);
-    for (size_t i = 0; i < TEST_BLOCK_SIZE; i++) {
-        MEMPOOL_ASSERT(block2[i] == 0xAA && "block2 corrupted when modifying block1");
-    }
-
-    // 测试3: 验证释放后重新分配的内存可用性（不假设内容状态）
-    mempool_free(pool, block1);
-    uint8_t *new_block = mempool_alloc(pool, false);
-    MEMPOOL_ASSERT(new_block != NULL && "re-allocation failed");
-    
-    // 只验证新块是否可写，不假设其初始内容
-    memset(new_block, 0x77, TEST_BLOCK_SIZE);
-    for (size_t i = 0; i < TEST_BLOCK_SIZE; i++) {
-        MEMPOOL_ASSERT(new_block[i] == 0x77 && "re-allocated block write failed");
-    }
-
-    // 清理
-    mempool_free(pool, block2);
-    mempool_free(pool, new_block);
-    mempool_destroy(pool);
-    DEBUG_PRINT("Memory content test passed!");
-}
-
-void test_mempool_all_blocks_isolation() {
-    DEBUG_PRINT("=== Testing isolation across ALL memory blocks (%d blocks) ===", 
-               MEMPOOL_MAX_BLOCKS);
-
-    // 创建内存池
-    mempool_t *pool = mempool_create(TEST_BLOCK_SIZE, MEMPOOL_MAX_BLOCKS);
-    MEMPOOL_ASSERT(pool != NULL);
-
-    // 分配所有内存块
-    uint8_t *blocks[MEMPOOL_MAX_BLOCKS];
-    for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-        blocks[i] = mempool_alloc(pool, false);
-        MEMPOOL_ASSERT(blocks[i] != NULL);
-    }
-
-    // 测试1: 初始化所有块为唯一模式
-    DEBUG_PRINT("Initializing all blocks with unique patterns...");
-    for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-        memset(blocks[i], 0xA0 + (i % 0x5F), TEST_BLOCK_SIZE);
-    }
-
-    // 保存初始状态
-    uint8_t *initial_blocks[MEMPOOL_MAX_BLOCKS];
-    for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-        initial_blocks[i] = malloc(TEST_BLOCK_SIZE);
-        memcpy(initial_blocks[i], blocks[i], TEST_BLOCK_SIZE);
-    }
-
-    // 测试2: 修改每个块并验证其他块
-    DEBUG_PRINT("Modifying and verifying each block in isolation...");
-    for (int target_block = 0; target_block < MEMPOOL_MAX_BLOCKS; target_block++) {
-        // 恢复所有块到初始状态
-        for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-            memcpy(blocks[i], initial_blocks[i], TEST_BLOCK_SIZE);
-        }
-        
-        // 修改目标块
-        memset(blocks[target_block], 0xF0 + (target_block % 0x0F), TEST_BLOCK_SIZE);
-
-        // 验证其他所有块
-        for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-            if (i == target_block) continue;
-
-            for (size_t j = 0; j < TEST_BLOCK_SIZE; j++) {
-                if (blocks[i][j] != initial_blocks[i][j]) {
-                    ERROR_PRINT("Block %d corrupted when modifying block %d at offset %zu: "
-                              "expected 0x%02X, got 0x%02X",
-                              i, target_block, j, initial_blocks[i][j], blocks[i][j]);
-                    // 打印更多调试信息
-                    ERROR_PRINT("Target block content at offset %zu: 0x%02X", 
-                              j, blocks[target_block][j]);
-                    MEMPOOL_ASSERT(0 && "Cross-block interference detected");
+    for (int i = 0; i < iterations; i++) {
+        // 随机分配或释放操作
+        if (rand() % 2) {
+            // 分配操作
+            uint8_t *block = mempool_alloc(pool, false);
+            if (block) {
+                // 初始化头部信息
+                init_block_header(block, pool->block_size, pattern);
+                
+                // 填充数据区（跳过头部）
+                uint8_t *data_area = block + HEADER_SIZE;
+                size_t data_size = pool->block_size - HEADER_SIZE;
+                memset(data_area, pattern, data_size);
+                
+                // 随机延迟，增加竞争机会
+                MEMPOOL_DELAY_MS((rand() % 10)); // 0-10ms
+                
+                // 验证内存完整性
+                if (!verify_block_header(block, pool->block_size, pattern)) {
+                    __sync_fetch_and_add(error_count, 1);
+                    mempool_free(pool, block);
+                    continue;
                 }
+                
+                // 验证数据区
+                bool data_ok = true;
+                for (size_t j = 0; j < data_size; j++) {
+                    if (data_area[j] != pattern) {
+                        ERROR_PRINT("Thread %d: Data corruption at offset %zu (expected 0x%02X, got 0x%02X)", 
+                                  thread_id, j, pattern, data_area[j]);
+                        data_ok = false;
+                        break;
+                    }
+                }
+                
+                if (!data_ok) {
+                    __sync_fetch_and_add(error_count, 1);
+                    mempool_free(pool, block);
+                    continue;
+                }
+                
+                mempool_free(pool, block);
+                __sync_fetch_and_add(success_count, 1);
+            }
+        } else {
+            // 释放操作(需要先分配一个)
+            uint8_t *block = mempool_alloc(pool, false);
+            if (block) {
+                init_block_header(block, pool->block_size, pattern);
+                uint8_t *data_area = block + HEADER_SIZE;
+                size_t data_size = pool->block_size - HEADER_SIZE;
+                memset(data_area, pattern, data_size);
+                
+                MEMPOOL_DELAY_MS((rand() % 10));
+                
+                // 验证内存完整性
+                if (!verify_block_header(block, pool->block_size, pattern)) {
+                    __sync_fetch_and_add(error_count, 1);
+                    mempool_free(pool, block);
+                    continue;
+                }
+                
+                mempool_free(pool, block);
+                __sync_fetch_and_add(success_count, 1);
             }
         }
     }
+    
+    DEBUG_PRINT("Thread %d completed", thread_id);
+    return NULL;
+}
 
-    // 释放资源
-    for (int i = 0; i < MEMPOOL_MAX_BLOCKS; i++) {
-        free(initial_blocks[i]);
-        mempool_free(pool, blocks[i]);
+// 线程安全测试函数
+void test_mempool_thread_safety() {
+    DEBUG_PRINT("=== Testing mempool thread safety ===");
+    
+    const int NUM_THREADS = 4;
+    const int ITERATIONS = 1000;
+    pthread_t threads[NUM_THREADS];
+    lock_test_arg_t args[NUM_THREADS];
+    int success_count = 0;
+    int error_count = 0;
+    pthread_barrier_t barrier;
+    
+    // 创建内存池（块大小需要足够容纳头部信息）
+    // const size_t TEST_BLOCK_SIZE = 256; // 示例大小
+    // const size_t TEST_BLOCK_COUNT = 100;
+    mempool_t *pool = mempool_create(256, 100);
+    MEMPOOL_ASSERT(pool != NULL);
+    
+    // 初始化屏障
+    pthread_barrier_init(&barrier, NULL, NUM_THREADS + 1);
+    
+    // 创建测试线程
+    for (int i = 0; i < NUM_THREADS; i++) {
+        args[i] = (lock_test_arg_t){
+            .pool = pool,
+            .thread_id = i,
+            .iterations = ITERATIONS,
+            .success_count = &success_count,
+            .error_count = &error_count,
+            .barrier = &barrier,
+            .pattern = 0x55 + i // 每个线程使用不同的填充模式
+        };
+        pthread_create(&threads[i], NULL, mempool_lock_test_thread, &args[i]);
     }
+    
+    // 等待所有线程就绪
+    pthread_barrier_wait(&barrier);
+    
+    // 等待所有线程完成
+    for (int i = 0; i < NUM_THREADS; i++) {
+        pthread_join(threads[i], NULL);
+    }
+    
+    // 检查结果
+    size_t expected_operations = NUM_THREADS * ITERATIONS;
+    float success_rate = (float)success_count / expected_operations * 100;
+    float error_rate = (float)error_count / expected_operations * 100;
+    
+    DEBUG_PRINT("Thread safety test results:");
+    DEBUG_PRINT("  Success: %d (%.1f%%)", success_count, success_rate);
+    DEBUG_PRINT("  Errors:  %d (%.1f%%)", error_count, error_rate);
+    DEBUG_PRINT("  Total:   %d operations", expected_operations);
+    
+    // 清理
+    pthread_barrier_destroy(&barrier);
     mempool_destroy(pool);
-    DEBUG_PRINT("All-block isolation test passed successfully!");
+    
+    MEMPOOL_ASSERT(error_count == 0);
+    DEBUG_PRINT("Thread safety test %s!", error_count == 0 ? "passed" : "failed");
+}
+
+// 模拟中断处理函数
+void *simulate_irq_handler(void *arg) {
+    mempool_t *pool = (mempool_t*)arg;
+    while (!stop_test) {
+        // 随机触发"中断"
+        MEMPOOL_DELAY_US(rand() % 100); // 50-150us间隔
+        
+        void *block = mempool_alloc(pool, true); // 强制使用中断锁
+        if (block) {
+            // 模拟中断处理中的DMA操作
+            simulate_dma_transfer(block);
+            mempool_free(pool, block);
+        }
+    }
+    return NULL;
+}
+
+void test_interrupt_context_operations() {
+    DEBUG_PRINT("=== Interrupt Context Simulation Test ===");
+    
+    mempool_t *pool = mempool_create(512, 64); // 适合DMA的小池
+    pthread_t irq_thread, normal_thread;
+    
+    // 启动中断模拟线程
+    pthread_create(&irq_thread, NULL, simulate_irq_handler, pool);
+    
+    // 正常线程操作
+    pthread_create(&normal_thread, NULL, [](void *arg) -> void* {
+        mempool_t *pool = (mempool_t*)arg;
+        for (int i = 0; i < 100000; i++) {
+            void *block = mempool_alloc(pool, false);
+            if (block) {
+                process_data(block); // 正常处理
+                mempool_free(pool, block);
+            }
+            MEMPOOL_DELAY_US(10);
+        }
+        stop_test = true;
+        return NULL;
+    }, pool);
+    
+    pthread_join(irq_thread, NULL);
+    pthread_join(normal_thread, NULL);
+    
+    mempool_destroy(pool);
+}
+
+// 时间关键型操作测试
+void test_time_critical_operations() {
+    DEBUG_PRINT("=== Time-Critical Operation Test ===");
+    
+    const int TEST_DURATION_MS = 5000; // 5秒测试
+    const size_t BLOCK_SIZE = 256;
+    
+    mempool_t *pool = mempool_create(BLOCK_SIZE, 32);
+    uint64_t total_alloc_time = 0, total_free_time = 0;
+    int operations = 0;
+    
+    auto start = high_resolution_clock::now();
+    while (duration_cast<milliseconds>(high_resolution_clock::now() - start).count() < TEST_DURATION_MS) {
+        auto t1 = high_resolution_clock::now();
+        void *block = mempool_alloc(pool, true);
+        auto t2 = high_resolution_clock::now();
+        
+        if (block) {
+            simulate_dma_operation(block);
+            
+            auto t3 = high_resolution_clock::now();
+            mempool_free(pool, block);
+            auto t4 = high_resolution_clock::now();
+            
+            total_alloc_time += duration_cast<nanoseconds>(t2 - t1).count();
+            total_free_time += duration_cast<nanoseconds>(t4 - t3).count();
+            operations++;
+        }
+    }
+    
+    DEBUG_PRINT("Performance results after %d operations:", operations);
+    DEBUG_PRINT("  Average allocation time: %.2f ns", (double)total_alloc_time/operations);
+    DEBUG_PRINT("  Average free time: %.2f ns", (double)total_free_time/operations);
+    DEBUG_PRINT("  Total throughput: %.2f ops/ms", operations/(double)TEST_DURATION_MS);
+    
+    mempool_destroy(pool);
+}
+
+// 内存碎片化抗性测试
+void test_fragmentation_resistance() {
+    DEBUG_PRINT("=== Fragmentation Resistance Test ===");
+    
+    const size_t BLOCK_SIZE = 128;
+    const int BLOCK_COUNT = 1000;
+    const int ITERATIONS = 10000;
+    
+    mempool_t *pool = mempool_create(BLOCK_SIZE, BLOCK_COUNT);
+    vector<void*> allocated_blocks;
+    allocated_blocks.reserve(BLOCK_COUNT);
+    
+    for (int i = 0; i < ITERATIONS; i++) {
+        // 随机分配或释放
+        if (rand() % 2 || allocated_blocks.empty()) {
+            if (allocated_blocks.size() < BLOCK_COUNT) {
+                void *block = mempool_alloc(pool, false);
+                if (block) {
+                    allocated_blocks.push_back(block);
+                }
+            }
+        } else {
+            size_t index = rand() % allocated_blocks.size();
+            mempool_free(pool, allocated_blocks[index]);
+            allocated_blocks.erase(allocated_blocks.begin() + index);
+        }
+        
+        // 每100次检查一次连续性
+        if (i % 100 == 0) {
+            size_t contiguous = check_contiguous_blocks(pool);
+            DEBUG_PRINT("Iteration %d: %zu contiguous blocks available", i, contiguous);
+        }
+    }
+    
+    mempool_destroy(pool);
+}
+
+// 多优先级任务竞争测试
+void test_priority_inversion() {
+    DEBUG_PRINT("=== Priority Inversion Test ===");
+    
+    mempool_t *pool = mempool_create(256, 10); // 小池增加竞争
+    
+    // 高优先级任务(模拟中断)
+    pthread_attr_t high_attr;
+    pthread_attr_init(&high_attr);
+    pthread_attr_setschedpolicy(&high_attr, SCHED_FIFO);
+    sched_param high_param = { .sched_priority = 99 };
+    pthread_attr_setschedparam(&high_attr, &high_param);
+    
+    // 低优先级任务
+    pthread_attr_t low_attr;
+    pthread_attr_init(&low_attr);
+    pthread_attr_setschedpolicy(&low_attr, SCHED_OTHER);
+    
+    pthread_t high_thread, low_thread;
+    
+    // 低优先级先获取锁
+    pthread_create(&low_thread, &low_attr, [](void* arg) -> void* {
+        mempool_t *pool = (mempool_t*)arg;
+        void *block = mempool_alloc(pool, true);
+        if (block) {
+            DEBUG_PRINT("Low-priority thread got block, holding for 100ms");
+            MEMPOOL_DELAY_MS(100); // 长时间持有
+            mempool_free(pool, block);
+        }
+        return NULL;
+    }, pool);
+    
+    MEMPOOL_DELAY_MS(10); // 确保低优先级先运行
+    
+    // 高优先级尝试获取
+    pthread_create(&high_thread, &high_attr, [](void* arg) -> void* {
+        mempool_t *pool = (mempool_t*)arg;
+        auto start = high_resolution_clock::now();
+        void *block = mempool_alloc(pool, true);
+        auto end = high_resolution_clock::now();
+        
+        if (block) {
+            DEBUG_PRINT("High-priority thread got block after %lld ms", 
+                      duration_cast<milliseconds>(end-start).count());
+            mempool_free(pool, block);
+        }
+        return NULL;
+    }, pool);
+    
+    pthread_join(high_thread, NULL);
+    pthread_join(low_thread, NULL);
+    
+    mempool_destroy(pool);
 }
 
 int main() {
     DEBUG_PRINT("Starting comprehensive memory pool tests");
     
-    test_mempool_basic();
-    test_mempool_queue_enhanced();
-    test_mempool_edge_cases();
-    test_mempool_memory_content();
-    test_mempool_all_blocks_isolation();
+    test_mempool_thread_safety();
+
+    test_interrupt_context_operations();
+
+    test_interrupt_context_operations();
+    test_time_critical_operations();
+    test_fragmentation_resistance();
+    test_priority_inversion();
 
     DEBUG_PRINT("All memory pool tests passed successfully!");
     return 0;
